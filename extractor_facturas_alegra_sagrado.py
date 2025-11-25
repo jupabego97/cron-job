@@ -15,6 +15,7 @@ import sys
 import asyncio
 import aiohttp
 import nest_asyncio
+import time
 
 # Cargar variables de entorno desde .env
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
@@ -44,6 +45,17 @@ CONCURRENT_REQUESTS = 7    # Máximo de peticiones simultáneas
 RETRY_DELAY_429 = 60         # Segundos a esperar tras error 429
 NETWORK_ERROR_DELAY = 5      # Segundos a esperar tras excepción de red
 MAX_RETRIES = 5              # Número máximo de reintentos por página
+
+# -----------------------------
+# Configuración de BD robusta (wake-up e inserción garantizada)
+# -----------------------------
+DB_WAKE_UP_RETRIES = 5       # Intentos para despertar la BD
+DB_WAKE_UP_INITIAL_DELAY = 5  # Segundos iniciales de espera entre intentos de wake-up
+DB_WAKE_UP_MAX_DELAY = 30     # Máximo de segundos entre intentos de wake-up
+DB_INSERT_RETRIES = 5         # Intentos para inserción de datos
+DB_INSERT_INITIAL_DELAY = 3   # Segundos iniciales de espera entre intentos de inserción
+DB_INSERT_CHUNK_SIZE = 100    # Tamaño de chunk para inserción fallback
+DB_INSERT_INDIVIDUAL_RETRIES = 3  # Reintentos para inserción individual
 
 
 # -----------------------------
@@ -158,9 +170,10 @@ class AlegraFacturasExtractor:
 
             self.engine = create_engine(connection_string)
 
-            # Probar conexión
-            with self.engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
+            # Despertar la BD con reintentos (maneja BD dormida en Railway)
+            if not self.wake_up_database():
+                logger.error("No se pudo despertar la base de datos después de múltiples intentos")
+                return False
 
             logger.info("Conexión a la base de datos establecida exitosamente")
             return True
@@ -168,6 +181,56 @@ class AlegraFacturasExtractor:
         except Exception as e:
             logger.error(f"Error conectando a la base de datos: {e}")
             return False
+
+    def wake_up_database(self):
+        """
+        Despertar la base de datos con reintentos exponenciales.
+        Las BD de Railway entran en modo sleep cuando no se usan y necesitan
+        tiempo para despertar antes de aceptar conexiones/queries.
+        """
+        if not self.engine:
+            logger.error("No hay engine de base de datos configurado")
+            return False
+
+        delay = DB_WAKE_UP_INITIAL_DELAY
+        
+        for attempt in range(1, DB_WAKE_UP_RETRIES + 1):
+            try:
+                logger.info(f"🔄 Intentando despertar BD (intento {attempt}/{DB_WAKE_UP_RETRIES})...")
+                
+                with self.engine.connect() as conn:
+                    # Query simple para despertar la BD
+                    conn.execute(text("SELECT 1"))
+                    # Query adicional para asegurar que la BD está completamente lista
+                    conn.execute(text("SELECT current_timestamp"))
+                
+                logger.info("✅ Base de datos despierta y lista para recibir conexiones")
+                return True
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                is_sleep_error = any(x in error_str for x in ['503', 'timeout', 'connection', 'unavailable', 'sleeping'])
+                
+                if attempt < DB_WAKE_UP_RETRIES:
+                    if is_sleep_error:
+                        logger.warning(
+                            f"⏳ BD posiblemente dormida (error: {type(e).__name__}). "
+                            f"Esperando {delay}s antes de reintentar..."
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠️ Error conectando a BD: {e}. "
+                            f"Esperando {delay}s antes de reintentar..."
+                        )
+                    
+                    time.sleep(delay)
+                    # Backoff exponencial con límite máximo
+                    delay = min(delay * 2, DB_WAKE_UP_MAX_DELAY)
+                else:
+                    logger.error(f"❌ No se pudo despertar la BD después de {DB_WAKE_UP_RETRIES} intentos: {e}")
+                    return False
+        
+        return False
 
     def create_table_if_not_exists(self):
         """Crear tabla facturas si no existe o verificar estructura."""
@@ -467,26 +530,182 @@ class AlegraFacturasExtractor:
         return result_df
 
     def insert_to_database(self, df):
-        """Insertar datos en la base de datos."""
+        """
+        Insertar datos en la base de datos con garantía de inserción.
+        
+        Estrategia de inserción robusta:
+        1. Intentar inserción en batch completo con reintentos
+        2. Si falla, dividir en chunks más pequeños
+        3. Si un chunk falla, insertar registro por registro
+        4. Registrar qué registros fallaron definitivamente
+        """
         if df.empty:
             logger.info("No hay datos para insertar")
             return True
 
-        try:
-            logger.info(f"Insertando {len(df)} registros en la base de datos...")
-            df.to_sql(
-                "facturas",
-                self.engine,
-                if_exists="append",
-                index=False,
-                dtype=self.dtype_mapping
-            )
-            logger.info("Datos insertados exitosamente")
+        total_records = len(df)
+        logger.info(f"📊 Iniciando inserción garantizada de {total_records} registros...")
+
+        # Intentar inserción en batch completo
+        if self._insert_batch_with_retry(df):
+            logger.info(f"✅ Todos los {total_records} registros insertados exitosamente en batch")
             return True
 
-        except Exception as e:
-            logger.error(f"Error insertando datos: {e}")
+        # Si el batch completo falla, dividir en chunks
+        logger.warning("⚠️ Inserción en batch falló. Intentando inserción por chunks...")
+        
+        inserted_count = 0
+        failed_records = []
+        
+        # Dividir en chunks
+        chunks = [df[i:i + DB_INSERT_CHUNK_SIZE] for i in range(0, len(df), DB_INSERT_CHUNK_SIZE)]
+        logger.info(f"📦 Dividiendo en {len(chunks)} chunks de máximo {DB_INSERT_CHUNK_SIZE} registros")
+        
+        for chunk_idx, chunk_df in enumerate(chunks):
+            chunk_start_id = chunk_df['id'].iloc[0] if 'id' in chunk_df.columns else 'N/A'
+            chunk_end_id = chunk_df['id'].iloc[-1] if 'id' in chunk_df.columns else 'N/A'
+            
+            logger.info(f"📦 Procesando chunk {chunk_idx + 1}/{len(chunks)} (IDs: {chunk_start_id}-{chunk_end_id})...")
+            
+            if self._insert_batch_with_retry(chunk_df, is_chunk=True):
+                inserted_count += len(chunk_df)
+                logger.info(f"✅ Chunk {chunk_idx + 1} insertado exitosamente ({len(chunk_df)} registros)")
+            else:
+                # Si el chunk falla, insertar registro por registro
+                logger.warning(f"⚠️ Chunk {chunk_idx + 1} falló. Insertando registro por registro...")
+                chunk_inserted, chunk_failed = self._insert_individual_records(chunk_df)
+                inserted_count += chunk_inserted
+                failed_records.extend(chunk_failed)
+        
+        # Resumen final
+        logger.info("=" * 60)
+        logger.info(f"📊 RESUMEN DE INSERCIÓN:")
+        logger.info(f"   Total de registros: {total_records}")
+        logger.info(f"   Insertados exitosamente: {inserted_count}")
+        logger.info(f"   Fallidos: {len(failed_records)}")
+        
+        if failed_records:
+            logger.error(f"❌ IDs de registros que NO se pudieron insertar: {failed_records[:50]}{'...' if len(failed_records) > 50 else ''}")
+            # Guardar registros fallidos en un archivo para revisión manual
+            self._save_failed_records(df[df['id'].isin(failed_records)])
             return False
+        
+        logger.info("=" * 60)
+        return True
+
+    def _insert_batch_with_retry(self, df, is_chunk=False):
+        """
+        Intentar inserción de un batch/chunk con reintentos exponenciales.
+        """
+        delay = DB_INSERT_INITIAL_DELAY
+        batch_type = "chunk" if is_chunk else "batch completo"
+        
+        for attempt in range(1, DB_INSERT_RETRIES + 1):
+            try:
+                # Verificar que la conexión esté activa antes de insertar
+                with self.engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                
+                # Realizar la inserción
+                df.to_sql(
+                    "facturas",
+                    self.engine,
+                    if_exists="append",
+                    index=False,
+                    dtype=self.dtype_mapping
+                )
+                return True
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                is_recoverable = any(x in error_str for x in ['503', 'timeout', 'connection', 'unavailable', 'sleeping', 'broken pipe'])
+                
+                if attempt < DB_INSERT_RETRIES and is_recoverable:
+                    logger.warning(
+                        f"⚠️ Error en inserción de {batch_type} (intento {attempt}/{DB_INSERT_RETRIES}): {type(e).__name__}. "
+                        f"Esperando {delay}s..."
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, DB_WAKE_UP_MAX_DELAY)
+                    
+                    # Intentar reconectar
+                    try:
+                        self.engine.dispose()
+                        self.wake_up_database()
+                    except Exception:
+                        pass
+                else:
+                    if not is_recoverable:
+                        logger.error(f"❌ Error no recuperable en inserción de {batch_type}: {e}")
+                    else:
+                        logger.error(f"❌ Falló inserción de {batch_type} después de {DB_INSERT_RETRIES} intentos: {e}")
+                    return False
+        
+        return False
+
+    def _insert_individual_records(self, df):
+        """
+        Insertar registros uno por uno como último recurso.
+        Retorna (cantidad_insertados, lista_ids_fallidos).
+        """
+        inserted = 0
+        failed_ids = []
+        
+        for idx, row in df.iterrows():
+            record_df = pd.DataFrame([row])
+            record_id = row.get('id', f'idx_{idx}')
+            
+            success = False
+            for attempt in range(1, DB_INSERT_INDIVIDUAL_RETRIES + 1):
+                try:
+                    # Verificar conexión
+                    with self.engine.connect() as conn:
+                        conn.execute(text("SELECT 1"))
+                    
+                    # Insertar registro individual
+                    record_df.to_sql(
+                        "facturas",
+                        self.engine,
+                        if_exists="append",
+                        index=False,
+                        dtype=self.dtype_mapping
+                    )
+                    success = True
+                    break
+                    
+                except Exception as e:
+                    if attempt < DB_INSERT_INDIVIDUAL_RETRIES:
+                        time.sleep(DB_INSERT_INITIAL_DELAY)
+                        try:
+                            self.engine.dispose()
+                            self.wake_up_database()
+                        except Exception:
+                            pass
+                    else:
+                        logger.error(f"❌ No se pudo insertar registro ID={record_id}: {e}")
+            
+            if success:
+                inserted += 1
+            else:
+                failed_ids.append(record_id)
+        
+        logger.info(f"   Inserción individual: {inserted} exitosos, {len(failed_ids)} fallidos")
+        return inserted, failed_ids
+
+    def _save_failed_records(self, failed_df):
+        """
+        Guardar registros fallidos en un archivo CSV para revisión manual.
+        """
+        if failed_df.empty:
+            return
+        
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"facturas_failed_{timestamp}.csv"
+            failed_df.to_csv(filename, index=False)
+            logger.warning(f"⚠️ Registros fallidos guardados en: {filename}")
+        except Exception as e:
+            logger.error(f"Error guardando registros fallidos: {e}")
 
     def export_to_csv(self, filename="facturas_backup.csv"):
         """Exportar todos los datos de la BD a CSV."""
