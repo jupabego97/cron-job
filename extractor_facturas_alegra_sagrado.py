@@ -45,6 +45,7 @@ CONCURRENT_REQUESTS = 7    # Máximo de peticiones simultáneas
 RETRY_DELAY_429 = 60         # Segundos a esperar tras error 429
 NETWORK_ERROR_DELAY = 5      # Segundos a esperar tras excepción de red
 MAX_RETRIES = 5              # Número máximo de reintentos por página
+RECOVERABLE_HTTP_ERRORS = [429, 500, 502, 503, 504]  # Errores HTTP que merecen reintento
 
 # -----------------------------
 # Configuración de BD robusta (wake-up e inserción garantizada)
@@ -63,12 +64,15 @@ DB_INSERT_INDIVIDUAL_RETRIES = 3  # Reintentos para inserción individual
 # -----------------------------
 async def fetch_invoice_batch(session, start, batch_size=LIMIT):
     """
-    Extrae una página de facturas y maneja errores 429 con reintento.
+    Extrae una página de facturas y maneja errores con reintento.
+    Reintenta automáticamente en errores 429, 500, 502, 503, 504 y timeouts.
     """
     url = (
         f"https://api.alegra.com/api/v1/invoices"
         f"?start={start}&order_direction=ASC&order_field=id&limit={batch_size}"
     )
+    delay = NETWORK_ERROR_DELAY
+    
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with session.get(url, headers=HEADERS, timeout=30) as response:
@@ -77,23 +81,43 @@ async def fetch_invoice_batch(session, start, batch_size=LIMIT):
                     data = await response.json()
                     logger.info(f"✅ Página start={start} extraída con {len(data)} facturas.")
                     return pd.DataFrame(data)
-                elif status == 429:
+                elif status in RECOVERABLE_HTTP_ERRORS:
+                    # Calcular delay según el tipo de error
+                    if status == 429:
+                        wait_time = RETRY_DELAY_429
+                    else:
+                        wait_time = delay
+                    
                     logger.warning(
-                        f"⚠️ Error 429 en start={start}. "
-                        f"Esperando {RETRY_DELAY_429}s antes de reintentar... "
+                        f"⚠️ Error {status} en start={start}. "
+                        f"Esperando {wait_time}s antes de reintentar... "
                         f"(Intento {attempt}/{MAX_RETRIES})"
                     )
-                    await asyncio.sleep(RETRY_DELAY_429)
+                    await asyncio.sleep(wait_time)
+                    # Backoff exponencial para errores que no son 429
+                    if status != 429:
+                        delay = min(delay * 2, 60)
                 else:
-                    logger.error(f"❌ Error {status} en start={start}. No se reintentará.")
+                    # Error no recuperable (4xx excepto 429)
+                    logger.error(f"❌ Error {status} en start={start}. Error no recuperable, no se reintentará.")
                     return pd.DataFrame()
-        except Exception as e:
-            logger.error(
-                f"💥 Excepción en start={start}: {e}. "
-                f"Esperando {NETWORK_ERROR_DELAY}s antes de reintentar... "
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"⏱️ Timeout en start={start}. "
+                f"Esperando {delay}s antes de reintentar... "
                 f"(Intento {attempt}/{MAX_RETRIES})"
             )
-            await asyncio.sleep(NETWORK_ERROR_DELAY)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+        except Exception as e:
+            logger.warning(
+                f"💥 Excepción en start={start}: {e}. "
+                f"Esperando {delay}s antes de reintentar... "
+                f"(Intento {attempt}/{MAX_RETRIES})"
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+    
     logger.error(f"⛔ Fallo definitivo en start={start} tras {MAX_RETRIES} intentos.")
     return pd.DataFrame()
 
